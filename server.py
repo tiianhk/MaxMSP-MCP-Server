@@ -1,14 +1,18 @@
 # server.py
 from mcp.server.fastmcp import FastMCP, Context
-from contextlib import asynccontextmanager
 import asyncio
+import signal
+import threading
+from contextlib import asynccontextmanager
 import socketio
 
-from typing import Callable, Any
+from typing import Any
 import logging
 import uuid
 import os
 import json
+from pathlib import Path
+from typing import Optional
 
 SOCKETIO_SERVER_URL = os.environ.get("SOCKETIO_SERVER_URL", "http://127.0.0.1")
 SOCKETIO_SERVER_PORT = os.environ.get("SOCKETIO_SERVER_PORT", "5002")
@@ -25,6 +29,104 @@ for obj_list in docs.values():
 
 io_server_started = False
 
+TAGGED_VAR_PREFIX = os.environ.get("MAXMCP_CLIENT_TAG_PREFIX", "maxmcpid")
+if not TAGGED_VAR_PREFIX.endswith("-"):
+    TAGGED_VAR_PREFIX = f"{TAGGED_VAR_PREFIX}-"
+
+DEFAULT_PATCH_PATH = os.environ.get(
+    "MAXMCP_PATCH_PATH",
+    os.path.join(current_dir, "MaxMSP_Agent", "demo.maxpat"),
+)
+
+INCLUDE_TAGGED_DEFAULT = os.environ.get("MAXMCP_INCLUDE_TAGGED", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+try:
+    PARENT_WATCHDOG_INTERVAL = max(
+        0.5, float(os.environ.get("MAXMCP_PARENT_POLL_SECONDS", "2.0"))
+    )
+except ValueError:
+    PARENT_WATCHDOG_INTERVAL = 2.0
+
+
+def _is_parent_alive(parent_pid: int) -> bool:
+    """Check if the original parent process is still alive."""
+    if parent_pid <= 1:
+        return False
+
+    current_ppid = os.getppid()
+    if current_ppid <= 1:
+        return False
+    if current_ppid == parent_pid:
+        return True
+
+    if os.name == "posix":
+        try:
+            os.kill(parent_pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    return True
+
+
+def _start_parent_exit_watchdog() -> Optional[threading.Event]:
+    """Trigger a graceful shutdown when the launching process exits."""
+    if os.environ.get("MAXMCP_DISABLE_PARENT_WATCHDOG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        return None
+
+    stop_event = threading.Event()
+
+    def _watch():
+        while not stop_event.wait(PARENT_WATCHDOG_INTERVAL):
+            if not _is_parent_alive(parent_pid):
+                logging.info(
+                    "Detected parent process (%s) exit; shutting down server.", parent_pid
+                )
+                try:
+                    os.kill(os.getpid(), signal.SIGINT)
+                except (AttributeError, RuntimeError, ValueError):
+                    os._exit(0)  # Fallback: immediate exit if signals unavailable
+                break
+
+    thread = threading.Thread(
+        target=_watch, name="maxmcp-parent-watchdog", daemon=True
+    )
+    thread.start()
+    return stop_event
+
+
+# Store to allow clean shutdown of the watchdog
+_parent_watchdog_stop_event: Optional[threading.Event] = None
+
+
+def resolve_patch_path(patch_path: Optional[str]) -> Optional[Path]:
+    """Resolve the Max patch path used for tagged object introspection."""
+    candidate = Path(patch_path) if patch_path else Path(DEFAULT_PATCH_PATH)
+    if not candidate.exists():
+        logging.warning(
+            "Tagged object introspection requested but patch path '%s' is missing",
+            candidate,
+        )
+        return None
+    return candidate
+
+
+
+
 
 class MaxMSPConnection:
     def __init__(self, server_url: str, server_port: int, namespace: str = NAMESPACE):
@@ -35,6 +137,11 @@ class MaxMSPConnection:
 
         self.sio = socketio.AsyncClient()
         self._pending = {}  # fetch requests that are not yet completed
+        self.console_messages = []
+
+        @self.sio.on("console_message", namespace=self.namespace)
+        async def _on_console_message(data):
+            self.console_messages.append(data)
 
         @self.sio.on("response", namespace=self.namespace)
         async def _on_response(data):
@@ -48,21 +155,36 @@ class MaxMSPConnection:
         await self.sio.emit("command", cmd, namespace=self.namespace)
         logging.info(f"Sent to MaxMSP: {cmd}")
 
-    async def send_request(self, payload: dict, timeout=2.0):
-        """Send a fetch request to MaxMSP."""
+    async def send_request(self, payload: dict, timeout=60.0):
+        """Send a fetch request to MaxMSP with enhanced error handling."""
         request_id = str(uuid.uuid4())
         future = asyncio.get_event_loop().create_future()
         self._pending[request_id] = future
 
         payload.update({"request_id": request_id})
-        await self.sio.emit("request", payload, namespace=self.namespace)
-        logging.info(f"Request to MaxMSP: {payload}")
 
         try:
+            await self.sio.emit("request", payload, namespace=self.namespace)
+            logging.info(f"Request to MaxMSP: {payload}")
+
             response = await asyncio.wait_for(future, timeout)
+
+            # Check if response indicates a warning (e.g., truncated large patch)
+            if isinstance(response, dict) and "warning" in response:
+                logging.warning(f"MaxMSP warning: {response['warning']}")
+
             return response
+
         except asyncio.TimeoutError:
-            raise TimeoutError(f"No response received in {timeout} seconds.")
+            logging.error(f"Request timeout after {timeout}s for action: {payload.get('action', 'unknown')}")
+            # For large patch requests, suggest the issue might be patch size
+            if payload.get("action") in ["get_objects_in_patch", "get_objects_in_selected"]:
+                raise TimeoutError(f"Request timed out after {timeout}s. If working with a large patch, this may indicate the patch is too complex to process safely. Consider working with smaller sections.")
+            else:
+                raise TimeoutError(f"No response received in {timeout} seconds.")
+        except Exception as e:
+            logging.error(f"Error sending request to MaxMSP: {e}")
+            raise
         finally:
             self._pending.pop(request_id, None)
 
@@ -358,6 +480,8 @@ def get_object_doc(ctx: Context, object_name: str) -> dict:
 @mcp.tool()
 async def get_objects_in_patch(
     ctx: Context,
+    include_tagged: Optional[bool] = None,
+    patch_path: Optional[str] = None,
 ):
     """Retrieve the list of existing objects in the current Max patch.
 
@@ -369,17 +493,24 @@ async def get_objects_in_patch(
 
     Returns:
         list: A list of objects and patch cords.
+    Args:
+        include_tagged: When True, merge in objects tagged with the filtered
+            prefix from the on-disk patch file. Defaults to environment
+            variable `MAXMCP_INCLUDE_TAGGED`.
+        patch_path: Override path to the Max patch used for tagged lookups.
     """
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
-    payload = {"action": "get_objects_in_patch"}
+    should_include_tagged = INCLUDE_TAGGED_DEFAULT if include_tagged is None else include_tagged
+    payload = {"action": "get_objects_in_patch", "include_tagged": should_include_tagged}
     response = await maxmsp.send_request(payload)
-
     return [response]
 
 
 @mcp.tool()
 async def get_objects_in_selected(
     ctx: Context,
+    include_tagged: Optional[bool] = None,
+    patch_path: Optional[str] = None,
 ):
     """Retrieve the list of objects that is selected in a (unlocked) patcher window.
 
@@ -387,11 +518,16 @@ async def get_objects_in_selected(
 
     Returns:
         list: A list of objects and patch cords.
+    Args:
+        include_tagged: When True, merge in objects tagged with the filtered
+            prefix from the on-disk patch file. Defaults to environment
+            variable `MAXMCP_INCLUDE_TAGGED`.
+        patch_path: Override path to the Max patch used for tagged lookups.
     """
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
-    payload = {"action": "get_objects_in_selected"}
+    should_include_tagged = INCLUDE_TAGGED_DEFAULT if include_tagged is None else include_tagged
+    payload = {"action": "get_objects_in_selected", "include_tagged": should_include_tagged}
     response = await maxmsp.send_request(payload)
-
     return [response]
 
 
@@ -429,5 +565,23 @@ async def get_avoid_rect_position(ctx: Context):
     return response
 
 
+@mcp.tool()
+async def get_max_console_messages(ctx: Context) -> list:
+    """Retrieve the list of messages from the Max console.
+
+    Returns:
+        list: A list of messages from the Max console.
+    """
+    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    messages = maxmsp.console_messages.copy()
+    maxmsp.console_messages.clear()
+    return messages
+
+
 if __name__ == "__main__":
-    mcp.run()
+    try:
+        _parent_watchdog_stop_event = _start_parent_exit_watchdog()
+        mcp.run()
+    finally:
+        if _parent_watchdog_stop_event:
+            _parent_watchdog_stop_event.set()

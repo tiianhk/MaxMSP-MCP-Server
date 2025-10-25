@@ -1,5 +1,19 @@
 # MaxMSP-MCP Server
 
+### STATUS
+
+This project is currently stalled due to lack of developers and no response from the upstream developers.
+
+The MCP approach shows promise. I managed to add a console error reporting tool as a key problem with the original MCP is that it would put objects together but fail to notice any errors and would then carry on regardless. Compare with using a coding assistant with traditional code where any errors are integral to the development process.
+
+I have also found trying to develop this project with Codex CLI and other assistants to be extremely irritating. I'm not a trained software engineer (yet!) but nevertheless have been developing full blown applications in Apple Swift with Codex and other assistants with very few problems. But for some reason, likely being the cross domain nature of code (Javascript in this case) crossing over into the Max visual coding via objects and patch cords, the coding assistant starts making big mistakes constantly missing and breaking things. This does not happen when doing pure language based coding in Swift (the language I've been working in).
+
+Furture reccomendations: The MCP patch itself seems unecessarily complex. The original project that this was forked from has very little or zero code comments or documentation so its very difficult to work out the intent of the developer. However I'd suggest a future MCP approach could be implemented in pure Javascript in some way with very minimal use of objects. 
+
+The MCP has been successful as a proof of concept. The coding assistant can succesfully interrogate a Max patch and innumerate functionality and even make suggestions for fixes and so on. There was even some success with advanced fixes when fixing the MCP parts of demo.patch. The coding assistant, via the MCP, was able to connect patch cords correctly between the javascript objects to fix the console reporting tool. However for an MCP like this to be truly useful an LLM would need to have training in more Max patch examples.
+
+### Intro
+
 This project uses the [Model Context Protocol](https://modelcontextprotocol.io/introduction) (MCP) to let LLMs directly understand and generate Max patches.
 
 ### Understand: LLM Explaining a Max Patch

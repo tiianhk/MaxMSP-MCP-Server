@@ -1,12 +1,16 @@
 
 autowatch = 1; // 1
-inlets = 1; // Receive network messages here
-outlets = 3; // For status, responses, etc.
+inlets = 2; // inlet 0: network messages, inlet 1: console messages
+outlets = 4; // For status, responses, etc.
 
 var p = this.patcher
 var obj_count = 0;
 var boxes = [];
 var lines = [];
+var connection_count = 0;
+var MAX_CONNECTIONS = 500;
+var MAX_OBJECTS = 1; // disable object cap while testing stability with v8
+var console_messages = []; // Buffer for console messages
 
 function safe_parse_json(str) {
     try {
@@ -26,11 +30,41 @@ function split_long_string(inString, maxLength) {
     return result;
 }
 
+// Handler for inlet 1 - captures console messages
+function msg_int(val) {
+    if (inlet == 1) {
+        console_messages.push({type: "int", value: val, timestamp: Date.now()});
+    }
+}
+
+function msg_float(val) {
+    if (inlet == 1) {
+        console_messages.push({type: "float", value: val, timestamp: Date.now()});
+    }
+}
+
+function list() {
+    if (inlet == 1) {
+        var args = arrayfromargs(arguments);
+        console_messages.push({type: "list", value: args, timestamp: Date.now()});
+    }
+}
+
 // Called when a message arrives at inlet 0 (from [udpreceive] or similar)
 function anything() {
+    // If this is from inlet 1, store as console message
+    if (inlet == 1) {
+        var msg = arrayfromargs(messagename, arguments);
+        console_messages.push({type: messagename, value: msg, timestamp: Date.now()});
+        return;
+    }
+
     var msg = arrayfromargs(messagename, arguments).join(" ");
     var data = safe_parse_json(msg);
-    if (!data) return;
+    if (!data) {
+        outlet(3, "console_message", msg);
+        return;
+    }
 
     switch (data.action) {
         case "fetch_test":
@@ -42,14 +76,14 @@ function anything() {
             break;
         case "get_objects_in_patch":
             if (data.request_id) {
-                get_objects_in_patch(data.request_id);
+                get_objects_in_patch(data.request_id, data.include_tagged || false);
             } else {
                 outlet(0, "error", "Missing request_id for get_objects_in_patch");
             }
             break;
         case "get_objects_in_selected":
             if (data.request_id) {
-                get_objects_in_selected(data.request_id);
+                get_objects_in_selected(data.request_id, data.include_tagged || false);
             } else {
                 outlet(0, "error", "Missing request_id for get_objects_in_selected");
             }
@@ -119,6 +153,13 @@ function anything() {
         case "set_number":
             if (data.varname && data.num) {
                 set_number(data.varname, data.num);
+            }
+            break;
+        case "get_max_console_messages":
+            if (data.request_id) {
+                get_max_console_messages(data.request_id);
+            } else {
+                outlet(0, "error", "Missing request_id for get_max_console_messages");
             }
             break;
         default:
@@ -235,17 +276,37 @@ function set_number(varname, num) {
 // ========================================
 // fetch request:
 
-function get_objects_in_patch(request_id) {
-    
+function get_objects_in_patch(request_id, include_tagged) {
+
 	var p = this.patcher
     obj_count = 0;
     boxes = [];
     lines = [];
+    connection_count = 0;
 
-    p.applydeep(collect_objects);
+    var object_limit_reached = false;
+
+    try {
+        p.applydeep(function(obj) {
+            if (MAX_OBJECTS > 0 && obj_count >= MAX_OBJECTS) {
+                object_limit_reached = true;
+                return;
+            }
+            collect_objects(obj, include_tagged);
+        });
+    } catch (e) {
+        outlet(0, "error", "JavaScript error during patch analysis: " + e.message);
+        object_limit_reached = true;
+    }
+
     var patcher_dict = {};
     patcher_dict["boxes"] = boxes;
     patcher_dict["lines"] = lines;
+
+    if (object_limit_reached && MAX_OBJECTS > 0) {
+        patcher_dict["warning"] = "Safety limit reached (" + MAX_OBJECTS + " objects, " + MAX_CONNECTIONS + " connections). Analysis truncated to prevent crashes.";
+        outlet(0, "warning", "Large/complex patch detected - analysis limited to " + MAX_OBJECTS + " objects to prevent crashes");
+    }
 
     // use these if no v8:
     // var results = {"request_id": request_id, "results": patcher_dict}
@@ -255,19 +316,39 @@ function get_objects_in_patch(request_id) {
     outlet(2, "add_boxtext", request_id, JSON.stringify(patcher_dict, null, 0));
 }
 
-function get_objects_in_selected(request_id) {
-    
+function get_objects_in_selected(request_id, include_tagged) {
+
 	var p = this.patcher
     obj_count = 0;
     boxes = [];
     lines = [];
+    connection_count = 0;
 
-    p.applydeepif(collect_objects, function (obj) {
-        return obj.selected;
-    });
+    var object_limit_reached = false;
+
+    try {
+        p.applydeepif(function(obj) {
+            if (MAX_OBJECTS > 0 && obj_count >= MAX_OBJECTS) {
+                object_limit_reached = true;
+                return;
+            }
+            collect_objects(obj, include_tagged);
+        }, function (obj) {
+            return obj.selected;
+        });
+    } catch (e) {
+        outlet(0, "error", "JavaScript error during selection analysis: " + e.message);
+        object_limit_reached = true;
+    }
+
     var patcher_dict = {};
     patcher_dict["boxes"] = boxes;
     patcher_dict["lines"] = lines;
+
+    if (object_limit_reached && MAX_OBJECTS > 0) {
+        patcher_dict["warning"] = "Safety limit reached (" + MAX_OBJECTS + " objects, " + MAX_CONNECTIONS + " connections). Selection analysis truncated to prevent crashes.";
+        outlet(0, "warning", "Large/complex selection detected - analysis limited to " + MAX_OBJECTS + " objects to prevent crashes");
+    }
 
     // use these if no v8:
     // var results = {"request_id": request_id, "results": patcher_dict}
@@ -277,70 +358,121 @@ function get_objects_in_selected(request_id) {
     outlet(2, "add_boxtext", request_id, JSON.stringify(patcher_dict, null, 0));
 }
 
-function collect_objects(obj) {
-    //var keys = Object.keys(obj.varname);
-    //post(typeof obj.varname + "\n");
-    if (obj.varname.substring(0, 8) == "maxmcpid"){
+function collect_objects(obj, include_tagged) {
+    try {
+        // Skip objects with potentially dangerous varnmes
+        if (!include_tagged && obj.varname && obj.varname.substring(0, 8) == "maxmcpid"){
+            return;
+        }
+        if (!obj.varname){
+            obj.varname = "obj-" + obj_count;
+        }
+        obj_count += 1;
+
+        if ((obj_count % 200) === 0) {
+            var progress_msg = "collect_objects processed " + obj_count + " objects; latest maxclass=" + (obj.maxclass || "unknown") + " varname=" + obj.varname;
+            post(progress_msg);
+            outlet(3, "console_message", "v8: " + progress_msg);
+        }
+
+        // Safely collect patchcords with connection limit
+        try {
+            var outputs = obj.patchcords.outputs;
+            if (outputs && outputs.length){
+                for (var i = 0; i < Math.min(outputs.length, 20); i++) { // Limit connections per object
+                    if (connection_count >= MAX_CONNECTIONS) {
+                        break;
+                    }
+                    if (outputs[i] && outputs[i].dstobject && outputs[i].dstobject.varname) {
+                        lines.push({patchline: {
+                            source: [obj.varname, outputs[i].srcoutlet || 0],
+                            destination: [outputs[i].dstobject.varname, outputs[i].dstinlet || 0]
+                        }});
+                        connection_count++;
+                    }
+                }
+            }
+        } catch (e) {
+            // Skip patchcord collection if it fails
+        }
+
+        // Skip attribute collection entirely to prevent js_atomtoval crashes
+        // This was the main source of crashes in the stack trace
+
+        boxes.push({box:{
+            maxclass: obj.maxclass || "unknown",
+            varname: obj.varname,
+            patching_rect: obj.rect || [0, 0, 100, 20]
+        }});
+    } catch (e) {
+        // If any object processing fails, skip it entirely
         return;
     }
-    if (!obj.varname){
-        obj.varname = "obj-" + obj_count;
-    }
-    obj_count+=1;
-
-    var outputs = obj.patchcords.outputs;
-    if (outputs.length){
-        for (var i = 0; i < outputs.length; i++) {
-            lines.push({patchline: {
-                source: [obj.varname, outputs[i].srcoutlet],
-                destination: [outputs[i].dstobject.varname, outputs[i].dstinlet]
-            }})
-        }
-    }
-    var attrnames = obj.getattrnames();
-    var attr = {};
-    if (attrnames.length){
-        for (var i = 0; i < attrnames.length; i++) {
-            var name = attrnames[i];
-            var value = obj.getattr(name);
-            attr[name] = value;
-        }
-    }
-    boxes.push({box:{
-        maxclass: obj.maxclass,
-        varname: obj.varname,
-        patching_rect: obj.rect,
-        // numinlets: obj.patchcords.inputs.length,
-        // numoutputs: obj.patchcords.outputs.length,
-        // attributes: attr,
-    }})
 }
 
 function get_object_attributes(request_id, var_name) {
-    
-	var p = this.patcher
-    var obj = p.getnamed(var_name);
-    if (!obj) {
-        post("Object not found: " + var_name);
-	    return;
-    }
-    var attrnames = obj.getattrnames();
-    var attributes = {};
-    if (attrnames.length){
-        for (var i = 0; i < attrnames.length; i++) {
-            var name = attrnames[i];
-            var value = obj.getattr(name);
-            attributes[name] = value;
+    try {
+    	var p = this.patcher
+        var obj = p.getnamed(var_name);
+        if (!obj) {
+            var results = {"request_id": request_id, "results": {"error": "Object not found: " + var_name}}
+            outlet(1, "response", JSON.stringify(results, null, 0));
+    	    return;
         }
+
+        // Skip attribute retrieval for complex objects that can cause crashes
+        if (obj.maxclass == "js" || obj.maxclass == "node.script" || obj.maxclass == "v8" || obj.maxclass == "jsui") {
+            var results = {"request_id": request_id, "results": {"warning": "Attributes skipped for " + obj.maxclass + " objects to prevent crashes"}}
+            outlet(1, "response", JSON.stringify(results, null, 0));
+            return;
+        }
+
+        var attrnames = obj.getattrnames();
+        var attributes = {};
+
+        // Limit attribute collection and use safe retrieval
+        if (attrnames && attrnames.length){
+            var max_attrs = Math.min(attrnames.length, 50); // Limit to 50 attributes
+            for (var i = 0; i < max_attrs; i++) {
+                try {
+                    var name = attrnames[i];
+                    if (name && typeof name === "string") {
+                        // Skip potentially dangerous attributes
+                        if (name.indexOf("script") === -1 && name.indexOf("code") === -1) {
+                            var value = obj.getattr(name);
+                            // Only store simple values
+                            if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+                                attributes[name] = value;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Skip this attribute if it causes any error
+                    continue;
+                }
+            }
+        }
+
+        var results = {"request_id": request_id, "results": attributes}
+        outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
+    } catch (e) {
+        var results = {"request_id": request_id, "results": {"error": "Failed to get attributes: " + e.message}}
+        outlet(1, "response", JSON.stringify(results, null, 0));
     }
+}
 
-    // use these if no v8:
-    // var results = {"request_id": request_id, "results": patcher_dict}
-    // outlet(1, "response", split_long_string(JSON.stringify(results, null, 2), 2000));
+function get_max_console_messages(request_id) {
+    try {
+        // Copy the console messages and clear the buffer
+        var messages = console_messages.slice();
+        console_messages = [];
 
-    // use this if has v8:
-    var results = {"request_id": request_id, "results": attributes}
-    outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
+        var results = {"request_id": request_id, "results": messages}
+        outlet(1, "response", JSON.stringify(results, null, 0));
+    } catch (e) {
+        var results = {"request_id": request_id, "results": {"error": "Failed to get console messages: " + e.message}}
+        outlet(1, "response", JSON.stringify(results, null, 0));
+    }
 }
 
 function get_window_rect() {
@@ -351,31 +483,56 @@ function get_window_rect() {
 }
 
 function get_avoid_rect_position(request_id) {
-    var p = this.patcher;
-    var l, t, r, b;
-    p.applyif(
-        function (obj) {
-            if (obj.rect[0] < l || l == undefined) {
-                l = obj.rect[0];
-            }
-            if (obj.rect[1] < t || t == undefined) {
-                t = obj.rect[1];
-            }
-            if (obj.rect[2] > r || r == undefined) {
-                r = obj.rect[2];
-            }
-            if (obj.rect[3] > b || b == undefined) {
-                b = obj.rect[3];
-            }
-        }, 
-        function (obj) {
-            return obj.varname.substring(0, 8) == "maxmcpid"
-    });
-    var avoid_rect = [l, t, r, b];
+    try {
+        var p = this.patcher;
+        var l, t, r, b;
+        var obj_count = 0;
+        var MAX_RECT_OBJECTS = 500; // Limit objects for rect calculation
 
-    // use this if has v8:
-    var results = {"request_id": request_id, "results": avoid_rect}
-    outlet(1, "response", JSON.stringify(results, null, 1));
+        p.applyif(
+            function (obj) {
+                if (obj_count >= MAX_RECT_OBJECTS) {
+                    return; // Stop processing if we hit the limit
+                }
+                obj_count++;
+
+                try {
+                    if (obj.rect && obj.rect.length >= 4) {
+                        if (obj.rect[0] < l || l == undefined) {
+                            l = obj.rect[0];
+                        }
+                        if (obj.rect[1] < t || t == undefined) {
+                            t = obj.rect[1];
+                        }
+                        if (obj.rect[2] > r || r == undefined) {
+                            r = obj.rect[2];
+                        }
+                        if (obj.rect[3] > b || b == undefined) {
+                            b = obj.rect[3];
+                        }
+                    }
+                } catch (e) {
+                    // Skip this object if rect access fails
+                }
+            },
+            function (obj) {
+                try {
+                    return obj.varname && obj.varname.substring(0, 8) != "maxmcpid";
+                } catch (e) {
+                    return false;
+                }
+        });
+
+        // Provide sensible defaults if no valid rects found
+        var avoid_rect = [l || 50, t || 50, r || 300, b || 300];
+
+        var results = {"request_id": request_id, "results": avoid_rect}
+        outlet(1, "response", JSON.stringify(results, null, 1));
+    } catch (e) {
+        // Fallback rect if everything fails
+        var results = {"request_id": request_id, "results": [50, 50, 300, 300]}
+        outlet(1, "response", JSON.stringify(results, null, 1));
+    }
 }
 
 // ========================================

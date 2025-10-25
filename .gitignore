@@ -178,3 +178,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+MaxMSP_Agent/DECONTAMINATE.maxpat

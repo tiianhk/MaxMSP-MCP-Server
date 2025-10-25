@@ -33,8 +33,8 @@ function anything() {
             add_boxtext(arguments[0], arguments[1]);
             break;
         default:
-            // outlet(1, messagename, ...arguments);
-            outlet(1, "response", arguments[1]);
+            outlet(1, messagename, ...arguments);
+            // outlet(1, "response", arguments[1]);
     }
 }
 
@@ -42,6 +42,11 @@ function add_boxtext(request_id, data){
     // post(patcher_dict + "\n");
     var patcher_dict = safe_parse_json(data);
     var p = this.patcher;
+
+    if (!patcher_dict || !Array.isArray(patcher_dict.boxes)) {
+        outlet(0, "error", "add_boxtext: missing boxes in patcher_dict for request " + request_id);
+        return;
+    }
 
     patcher_dict.boxes.forEach(function (b) {
         var obj = p.getnamed(b.box.varname);
@@ -53,5 +58,4 @@ function add_boxtext(request_id, data){
     var results = {"request_id": request_id, "results": patcher_dict}
     outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
 }
-
 

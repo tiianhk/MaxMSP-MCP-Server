@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__MaxMSPMCP__get_object_doc",
+      "mcp__MaxMSPMCP__get_max_console_messages",
+      "mcp__MaxMSPMCP__get_objects_in_patch",
+      "mcp__MaxMSPMCP__send_messages_to_object",
+      "mcp__MaxMSPMCP__set_object_attribute",
+      "mcp__MaxMSPMCP__get_object_attributes",
+      "mcp__MaxMSPMCP__get_avoid_rect_position",
+      "mcp__MaxMSPMCP__add_max_object",
+      "mcp__MaxMSPMCP__connect_max_objects"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
