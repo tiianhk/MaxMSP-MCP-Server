@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "maxmsp": {
+      "command": "/Users/gagestohlmann/MaxMSP-MCP-Server/.venv/bin/python",
+      "args": ["/Users/gagestohlmann/MaxMSP-MCP-Server/server.py"]
+    }
+  }
+}
