@@ -44,9 +44,8 @@ class MaxMSPConnection:
                 fut.set_result(data.get("results"))
 
     async def send_command(self, cmd: dict):
-        """Send a command to MaxMSP."""
-        await self.sio.emit("command", cmd, namespace=self.namespace)
-        logging.info(f"Sent to MaxMSP: {cmd}")
+        """Wait for scope validation and execution; never report fire-and-forget success."""
+        return await self.send_request(cmd)
 
     async def send_request(self, payload: dict, timeout=2.0):
         """Send a fetch request to MaxMSP."""
@@ -60,6 +59,8 @@ class MaxMSPConnection:
 
         try:
             response = await asyncio.wait_for(future, timeout)
+            if isinstance(response, dict) and "error" in response:
+                raise ValueError(response["error"])
             return response
         except asyncio.TimeoutError:
             raise TimeoutError(f"No response received in {timeout} seconds.")
@@ -115,18 +116,40 @@ async def server_lifespan(server: FastMCP):
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "MaxMSPMCP",
-    description="MaxMSP integration through the Model Context Protocol",
+    instructions=(
+        "All live tools target the host patch containing the M4L MCP Agent and its ordinary subpatches. "
+        "The agent panel and its entire subtree are excluded from inspection and editing. "
+        "Use the qualified varname paths returned by listings (subpatch::object); ambiguous simple names are rejected. "
+        "Creation uses optional patcher_path, with an empty path targeting the host. "
+        "Do not attempt to access agent internals or bypass scope through Max scripting. "
+        "Object catalogue/documentation tools describe Max types and do not inspect live instances."
+        " In the standalone Max demo, the host is the run-agent patch containing the scripts; no Live host is required."
+    ),
     lifespan=server_lifespan,
 )
 
 
-@mcp.tool()
+def scoped_tool():
+    """Expose the same boundary in every tool description without changing signatures."""
+    def register(function):
+        function.__doc__ = (function.__doc__ or "") + (
+            "\n\nLive access is limited to the host patch and its non-agent subpatches. "
+            "The MCP Agent panel and all descendants are inaccessible. "
+            "Use returned qualified varname paths for nested targets. "
+            "Catalogue/documentation tools do not access live patch objects."
+        )
+        return mcp.tool()(function)
+    return register
+
+
+@scoped_tool()
 async def add_max_object(
     ctx: Context,
     position: list,
     obj_type: str,
     varname: str,
     args: list,
+    patcher_path: str = "",
 ):
     """Add a new Max object.
 
@@ -138,6 +161,7 @@ async def add_max_object(
         obj_type (str): Type of the Max object (e.g., "cycle~", "dac~").
         varname (str): Variable name for the object.
         args (list): Arguments for the object.
+        patcher_path (str): Qualified path of an ordinary subpatch, or empty for the host.
     """
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
     assert len(position) == 2, "Position must be a list of two integers."
@@ -147,12 +171,13 @@ async def add_max_object(
         "obj_type": obj_type,
         "args": args,
         "varname": varname,
+        "patcher_path": patcher_path,
     }
     cmd.update(kwargs)
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def remove_max_object(
     ctx: Context,
     varname: str,
@@ -169,7 +194,7 @@ async def remove_max_object(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def connect_max_objects(
     ctx: Context,
     src_varname: str,
@@ -197,7 +222,7 @@ async def connect_max_objects(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def disconnect_max_objects(
     ctx: Context,
     src_varname: str,
@@ -225,7 +250,7 @@ async def disconnect_max_objects(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def set_object_attribute(
     ctx: Context,
     varname: str,
@@ -246,7 +271,7 @@ async def set_object_attribute(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def set_message_text(
     ctx: Context,
     varname: str,
@@ -265,7 +290,7 @@ async def set_message_text(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def send_bang_to_object(ctx: Context, varname: str):
     """Send a bang to an object in MaxMSP.
 
@@ -279,7 +304,7 @@ async def send_bang_to_object(ctx: Context, varname: str):
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def send_messages_to_object(
     ctx: Context,
     varname: str,
@@ -305,7 +330,7 @@ async def send_messages_to_object(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 async def set_number(
     ctx: Context,
     varname: str,
@@ -326,14 +351,14 @@ async def set_number(
     await maxmsp.send_command(cmd)
 
 
-@mcp.tool()
+@scoped_tool()
 def list_all_objects(ctx: Context) -> list:
     """Returns a name list of all objects that can be added in Max.
     To understand a specific object in the list, use the `get_object_doc` tool."""
     return list(flattened_docs.keys())
 
 
-@mcp.tool()
+@scoped_tool()
 def get_object_doc(ctx: Context, object_name: str) -> dict:
     """Retrieve the official documentation for a given object.
     Use this resource to understand how a specific object works, including its
@@ -355,7 +380,7 @@ def get_object_doc(ctx: Context, object_name: str) -> dict:
         }
 
 
-@mcp.tool()
+@scoped_tool()
 async def get_objects_in_patch(
     ctx: Context,
 ):
@@ -377,7 +402,7 @@ async def get_objects_in_patch(
     return [response]
 
 
-@mcp.tool()
+@scoped_tool()
 async def get_objects_in_selected(
     ctx: Context,
 ):
@@ -395,7 +420,7 @@ async def get_objects_in_selected(
     return [response]
 
 
-@mcp.tool()
+@scoped_tool()
 async def get_object_attributes(ctx: Context, varname: str):
     """Retrieve an objects' attributes and values of the attributes.
 
@@ -413,7 +438,7 @@ async def get_object_attributes(ctx: Context, varname: str):
     return [response]
 
 
-@mcp.tool()
+@scoped_tool()
 async def get_avoid_rect_position(ctx: Context):
     """When deciding the position to add a new object to the path, this rectangular area
     should be avoid. This is useful when you want to add an object to the patch without

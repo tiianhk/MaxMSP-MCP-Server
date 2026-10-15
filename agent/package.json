@@ -2,7 +2,7 @@
   "name": "temp",
   "version": "1.0.0",
   "description": "",
-  "main": "boxtext.js",
+  "main": "max_mcp_node.js",
   "directories": {
     "test": "test"
   },
